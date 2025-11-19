@@ -1,6 +1,6 @@
 [package]
 name = "dloom-flow"
-version = "0.1.0"
+version = "1.0.0"
 description = "A Solana flow payment program created with Anchor"
 authors = ["Samuel Horjet <samuelhorjet001@gmail.com>"]
 repository = "https://github.com/samuelhorjet/dloom-flow"
