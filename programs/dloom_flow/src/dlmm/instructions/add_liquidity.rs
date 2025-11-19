@@ -1,0 +1,238 @@
+// FILE: programs/dloom_flow/src/dlmm/instructions/add_liquidity.rs
+
+use crate::{
+    dlmm::{
+        math, 
+        state::{Bin, DlmmPool, Position}, 
+    },
+    errors::DloomError,
+    events::DlmmLiquidityUpdate,
+    state::TransactionBins, // This is a top-level state now
+};
+use anchor_lang::prelude::*;
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
+use std::collections::HashMap; // Added for the validation step
+
+pub fn handle_dlmm_add_liquidity<'info>(
+    ctx: Context<'_, '_, 'info, 'info, DlmmAddLiquidity<'info>>,
+    start_bin_id: i32,
+    liquidity_per_bin: u128,
+) -> Result<()> {
+    require!(liquidity_per_bin > 0, DloomError::ZeroLiquidity);
+
+    // --- New Validation Step ---
+    // Create a HashMap of the provided account infos for quick lookup.
+    let account_infos_map: HashMap<Pubkey, &'info AccountInfo<'info>> = ctx
+    .remaining_accounts
+    .iter()
+    .map(|acc| (acc.key(), acc)) // Simply pass the reference, no .clone()
+    .collect();
+
+    // Verify that every pubkey in transaction_bins exists in the provided accounts.
+    for bin_pubkey in &ctx.accounts.transaction_bins.bins {
+        require!(
+            account_infos_map.contains_key(bin_pubkey),
+            DloomError::BinCacheMismatch
+        );
+    }
+    // --- End Validation ---
+
+    let bin_step = ctx.accounts.dlmm_pool.bin_step as i32;
+    let mut current_bin_id = start_bin_id;
+    let mut total_required_a: u128 = 0;
+    let mut total_required_b: u128 = 0;
+
+    // 1. First Pass: Calculate total required token amounts for this chunk of bins.
+    // We now iterate based on the length of the cached bins for reliability.
+    for _ in 0..ctx.accounts.transaction_bins.bins.len() {
+        require!(
+            current_bin_id >= ctx.accounts.position.lower_bin_id
+                && current_bin_id <= ctx.accounts.position.upper_bin_id,
+            DloomError::InvalidBinRange
+        );
+
+        let (required_a, required_b) = math::calculate_required_for_bin(
+            ctx.accounts.dlmm_pool.active_bin_id,
+            current_bin_id,
+            ctx.accounts.dlmm_pool.bin_step,
+            liquidity_per_bin,
+        )?;
+
+        total_required_a = total_required_a
+            .checked_add(required_a)
+            .ok_or(DloomError::MathOverflow)?;
+        total_required_b = total_required_b
+            .checked_add(required_b)
+            .ok_or(DloomError::MathOverflow)?;
+
+        current_bin_id = current_bin_id
+            .checked_add(bin_step)
+            .ok_or(DloomError::MathOverflow)?;
+    }
+
+    // 2. Transfer the calculated total tokens for this chunk. (Logic preserved)
+    if total_required_a > 0 {
+        token_interface::transfer_checked(
+            ctx.accounts.transfer_a_context(),
+            total_required_a as u64,
+            ctx.accounts.token_a_mint.decimals,
+        )?;
+    }
+    if total_required_b > 0 {
+        token_interface::transfer_checked(
+            ctx.accounts.transfer_b_context(),
+            total_required_b as u64,
+            ctx.accounts.token_b_mint.decimals,
+        )?;
+    }
+
+    // Defer mutable borrows until after CPIs to satisfy the borrow checker.
+    let dlmm_pool = &mut ctx.accounts.dlmm_pool;
+    if total_required_a > 0 {
+        dlmm_pool.reserves_a = dlmm_pool
+            .reserves_a
+            .checked_add(total_required_a as u64)
+            .ok_or(DloomError::MathOverflow)?;
+    }
+    if total_required_b > 0 {
+        dlmm_pool.reserves_b = dlmm_pool
+            .reserves_b
+            .checked_add(total_required_b as u64)
+            .ok_or(DloomError::MathOverflow)?;
+    }
+
+    // 3. Second Pass: Update the liquidity amount in each individual Bin account.
+    current_bin_id = start_bin_id;
+    // We iterate through the validated bin pubkeys from the cache.
+    for bin_pubkey in &ctx.accounts.transaction_bins.bins {
+        // Safe to unwrap due to the validation check at the beginning.
+        let bin_account_info = account_infos_map.get(bin_pubkey).unwrap();
+
+        let (expected_bin_pda, _) = Pubkey::find_program_address(
+            &[
+                b"bin",
+                dlmm_pool.key().as_ref(),
+                &current_bin_id.to_le_bytes(),
+            ],
+            ctx.program_id,
+        );
+        require_keys_eq!(
+            bin_account_info.key(),
+            expected_bin_pda,
+            DloomError::InvalidBinAccount
+        );
+
+        let bin_loader = AccountLoader::<'_, Bin>::try_from(bin_account_info)?;
+        let mut bin = bin_loader.load_mut()?;
+        bin.liquidity = bin
+            .liquidity
+            .checked_add(liquidity_per_bin)
+            .ok_or(DloomError::MathOverflow)?;
+
+        current_bin_id = current_bin_id
+            .checked_add(bin_step)
+            .ok_or(DloomError::MathOverflow)?;
+    }
+
+    // 4. Update the total liquidity in the position account.
+    let total_liquidity_added_in_chunk = liquidity_per_bin
+        .checked_mul(ctx.accounts.transaction_bins.bins.len() as u128)
+        .ok_or(DloomError::MathOverflow)?;
+
+    let position = &mut ctx.accounts.position;
+    position.liquidity = position
+        .liquidity
+        .checked_add(total_liquidity_added_in_chunk)
+        .ok_or(DloomError::MathOverflow)?;
+
+        emit!(DlmmLiquidityUpdate {
+    position_address: ctx.accounts.position.key(),
+    liquidity_added: total_liquidity_added_in_chunk as i128,
+    amount_a: total_required_a as u64,
+    amount_b: total_required_b as u64,
+});
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct DlmmAddLiquidity<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            b"dlmm_pool",
+            dlmm_pool.token_a_mint.as_ref(),
+            dlmm_pool.token_b_mint.as_ref(),
+            &dlmm_pool.bin_step.to_le_bytes()
+        ],
+        bump = dlmm_pool.bump
+    )]
+    pub dlmm_pool: Box<Account<'info, DlmmPool>>,
+
+    #[account(
+        mut,
+        has_one = owner,
+        constraint = position.pool == dlmm_pool.key() @ DloomError::InvalidPool
+    )]
+    pub position: Box<Account<'info, Position>>,
+
+    /// The temporary account that holds the pubkeys of the bins being modified.
+    #[account(
+        mut,
+        has_one = owner,
+        close = owner,
+        seeds = [b"transaction_bins", owner.key().as_ref()],
+        bump
+    )]
+    pub transaction_bins: Box<Account<'info, TransactionBins>>,
+
+    #[account(address = dlmm_pool.token_a_mint)]
+    pub token_a_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(address = dlmm_pool.token_b_mint)]
+    pub token_b_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(mut, token::mint = token_a_mint, has_one = owner)]
+    pub user_token_a_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, token::mint = token_b_mint, has_one = owner)]
+    pub user_token_b_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, address = dlmm_pool.token_a_vault)]
+    pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, address = dlmm_pool.token_b_vault)]
+    pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub token_a_program: Interface<'info, TokenInterface>,
+    pub token_b_program: Interface<'info, TokenInterface>,
+}
+
+// impl block with transfer contexts is preserved
+impl<'info> DlmmAddLiquidity<'info> {
+    fn transfer_a_context(&self) -> CpiContext<'_, '_, '_, 'info, TransferChecked<'info>> {
+        CpiContext::new(
+            self.token_a_program.to_account_info(),
+            TransferChecked {
+                from: self.user_token_a_account.to_account_info(),
+                to: self.token_a_vault.to_account_info(),
+                authority: self.owner.to_account_info(),
+                mint: self.token_a_mint.to_account_info(),
+            },
+        )
+    }
+
+    fn transfer_b_context(&self) -> CpiContext<'_, '_, '_, 'info, TransferChecked<'info>> {
+        CpiContext::new(
+            self.token_b_program.to_account_info(),
+            TransferChecked {
+                from: self.user_token_b_account.to_account_info(),
+                to: self.token_b_vault.to_account_info(),
+                authority: self.owner.to_account_info(),
+                mint: self.token_b_mint.to_account_info(),
+            },
+        )
+    }
+}

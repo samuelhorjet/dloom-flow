@@ -1,0 +1,336 @@
+// FILE: programs/dloom_flow/src/dlmm/instructions/swap.rs
+use crate::{
+    constants::*,
+    dlmm::{math, state::DlmmPool},
+    errors::DloomError,
+    events::DlmmSwapResult, // Added TransactionBins
+    state::TransactionBins,
+};
+use anchor_lang::prelude::*;
+use anchor_lang::AccountDeserialize;
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
+
+// Updated function signature and logic
+pub fn handle_dlmm_swap<'info>(
+    ctx: Context<'_, '_, 'info, 'info, DlmmSwap<'info>>,
+    amount_in: u64,
+    min_amount_out: u64,
+) -> Result<()> {
+    if let Some(referrer_account_info) = &ctx.accounts.referrer_fee_account {
+        // Manually deserialize the account data.
+        let data = referrer_account_info.try_borrow_data()?;
+        let referrer_token_account = TokenAccount::try_deserialize(&mut &data[..])?;
+
+        // Now, perform the constraint check on the deserialized account
+        require!(
+            referrer_token_account.mint == ctx.accounts.user_source_token_account.mint,
+            DloomError::InvalidMint
+        );
+    }
+    let dlmm_pool = &ctx.accounts.dlmm_pool;
+    let is_a_to_b = ctx.accounts.user_source_token_account.mint == dlmm_pool.token_a_mint;
+    let initial_active_bin_id = dlmm_pool.active_bin_id;
+
+    let (source_token_program, destination_token_program) = if is_a_to_b {
+        (
+            ctx.accounts.token_a_program.to_account_info(),
+            ctx.accounts.token_b_program.to_account_info(),
+        )
+    } else {
+        (
+            ctx.accounts.token_b_program.to_account_info(),
+            ctx.accounts.token_a_program.to_account_info(),
+        )
+    };
+
+    // 1. Calculate swap results. We now pass the transaction_bins account and the
+    // remaining_accounts directly to the math functions, which will handle validation.
+    let (amount_out, protocol_fee, final_active_bin_id) = if is_a_to_b {
+        math::swap_a_to_b(
+            &ctx.accounts.dlmm_pool, // Pass directly from the context
+            amount_in,
+            &ctx.accounts.transaction_bins,
+            ctx.remaining_accounts,
+            ctx.program_id,
+            &ctx.accounts.dlmm_pool.key(), // Pass directly from the context
+        )?
+    } else {
+        math::swap_b_to_a(
+            &ctx.accounts.dlmm_pool, // Pass directly from the context
+            amount_in,
+            &ctx.accounts.transaction_bins,
+            ctx.remaining_accounts,
+            ctx.program_id,
+            &ctx.accounts.dlmm_pool.key(), // Pass directly from the context
+        )?
+    };
+    require!(amount_out >= min_amount_out, DloomError::SlippageExceeded);
+
+    // 2. Transfer from user to the appropriate source vault. (Logic preserved)
+    let source_mint_decimals = if is_a_to_b {
+        ctx.accounts.token_a_mint.decimals
+    } else {
+        ctx.accounts.token_b_mint.decimals
+    };
+    let (dest_vault, source_mint_info) = if is_a_to_b {
+        (
+            ctx.accounts.token_a_vault.to_account_info(),
+            ctx.accounts.token_a_mint.to_account_info(),
+        )
+    } else {
+        (
+            ctx.accounts.token_b_vault.to_account_info(),
+            ctx.accounts.token_b_mint.to_account_info(),
+        )
+    };
+    token_interface::transfer_checked(
+        CpiContext::new(
+            source_token_program.clone(),
+            TransferChecked {
+                from: ctx.accounts.user_source_token_account.to_account_info(),
+                to: dest_vault,
+                authority: ctx.accounts.owner.to_account_info(),
+                mint: source_mint_info,
+            },
+        ),
+        amount_in,
+        source_mint_decimals,
+    )?;
+
+    // 3. Prepare signer seeds for all subsequent PDA-controlled transfers. (Logic preserved)
+    let bin_step_bytes = &dlmm_pool.bin_step.to_le_bytes()[..];
+    let bump = &[dlmm_pool.bump][..];
+    let signer_seeds = &[
+        b"dlmm_pool",
+        dlmm_pool.token_a_mint.as_ref(),
+        dlmm_pool.token_b_mint.as_ref(),
+        bin_step_bytes,
+        bump,
+    ][..];
+
+    // 4. Handle fee distribution (Referral and Protocol). (Logic preserved)
+    let mut actual_protocol_fee = protocol_fee;
+
+    if protocol_fee > 0 && dlmm_pool.referrer_fee_share > 0 {
+        if let Some(referrer_account) = &ctx.accounts.referrer_fee_account {
+            let referral_fee = (protocol_fee as u128)
+                .checked_mul(dlmm_pool.referrer_fee_share as u128)
+                .ok_or(DloomError::MathOverflow)?
+                .checked_div(BASIS_POINT_MAX as u128)
+                .ok_or(DloomError::MathOverflow)? as u64;
+
+            if referral_fee > 0 {
+                actual_protocol_fee = protocol_fee
+                    .checked_sub(referral_fee)
+                    .ok_or(DloomError::MathOverflow)?;
+
+                let (fee_source_vault, fee_mint) = if is_a_to_b {
+                    (
+                        ctx.accounts.token_a_vault.to_account_info(),
+                        ctx.accounts.token_a_mint.to_account_info(),
+                    )
+                } else {
+                    (
+                        ctx.accounts.token_b_vault.to_account_info(),
+                        ctx.accounts.token_b_mint.to_account_info(),
+                    )
+                };
+
+                token_interface::transfer_checked(
+                    CpiContext::new_with_signer(
+                        source_token_program.clone(),
+                        TransferChecked {
+                            from: fee_source_vault,
+                            to: referrer_account.to_account_info(),
+                            authority: dlmm_pool.to_account_info(),
+                            mint: fee_mint,
+                        },
+                        &[signer_seeds],
+                    ),
+                    referral_fee,
+                    source_mint_decimals,
+                )?;
+            }
+        }
+    }
+
+    if actual_protocol_fee > 0 {
+        let (source_vault, fee_vault, mint) = if is_a_to_b {
+            (
+                ctx.accounts.token_a_vault.to_account_info(),
+                ctx.accounts.protocol_fee_vault_a.to_account_info(),
+                ctx.accounts.token_a_mint.to_account_info(),
+            )
+        } else {
+            (
+                ctx.accounts.token_b_vault.to_account_info(),
+                ctx.accounts.protocol_fee_vault_b.to_account_info(),
+                ctx.accounts.token_b_mint.to_account_info(),
+            )
+        };
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                source_token_program.clone(),
+                TransferChecked {
+                    from: source_vault,
+                    to: fee_vault,
+                    authority: dlmm_pool.to_account_info(),
+                    mint,
+                },
+                &[signer_seeds],
+            ),
+            actual_protocol_fee,
+            source_mint_decimals,
+        )?;
+    }
+
+    // 5. Transfer swapped amount to user. (Logic preserved)
+    if amount_out > 0 {
+        let (source_vault, mint, dest_mint_decimals) = if is_a_to_b {
+            (
+                ctx.accounts.token_b_vault.to_account_info(),
+                ctx.accounts.token_b_mint.to_account_info(),
+                ctx.accounts.token_b_mint.decimals,
+            )
+        } else {
+            (
+                ctx.accounts.token_a_vault.to_account_info(),
+                ctx.accounts.token_a_mint.to_account_info(),
+                ctx.accounts.token_a_mint.decimals,
+            )
+        };
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                destination_token_program.clone(),
+                TransferChecked {
+                    from: source_vault,
+                    to: ctx
+                        .accounts
+                        .user_destination_token_account
+                        .to_account_info(),
+                    authority: dlmm_pool.to_account_info(),
+                    mint,
+                },
+                &[signer_seeds],
+            ),
+            amount_out,
+            dest_mint_decimals,
+        )?;
+    }
+
+    // 6. Update DLMM pool state, now including the new volatility accumulator.
+    let dlmm_pool_mut = &mut ctx.accounts.dlmm_pool;
+    let bins_crossed = (final_active_bin_id - initial_active_bin_id).abs();
+
+    dlmm_pool_mut.active_bin_id = final_active_bin_id;
+    // Note: You must add `volatility_accumulator: u64` to your DlmmPool struct in state.rs
+    dlmm_pool_mut.volatility_accumulator = dlmm_pool_mut
+        .volatility_accumulator
+        .checked_add(bins_crossed as u64)
+        .ok_or(DloomError::MathOverflow)?;
+
+    let amount_for_lps = amount_in
+        .checked_sub(protocol_fee)
+        .ok_or(DloomError::MathOverflow)?;
+    if is_a_to_b {
+        dlmm_pool_mut.reserves_a = dlmm_pool_mut
+            .reserves_a
+            .checked_add(amount_for_lps)
+            .ok_or(DloomError::MathOverflow)?;
+        dlmm_pool_mut.reserves_b = dlmm_pool_mut
+            .reserves_b
+            .checked_sub(amount_out)
+            .ok_or(DloomError::MathOverflow)?;
+    } else {
+        dlmm_pool_mut.reserves_b = dlmm_pool_mut
+            .reserves_b
+            .checked_add(amount_for_lps)
+            .ok_or(DloomError::MathOverflow)?;
+        dlmm_pool_mut.reserves_a = dlmm_pool_mut
+            .reserves_a
+            .checked_sub(amount_out)
+            .ok_or(DloomError::MathOverflow)?;
+    }
+
+    // ... (rest of the function logic) ...
+
+    // Replace the old emit! with this new one at the end
+    emit!(DlmmSwapResult {
+        pool_address: ctx.accounts.dlmm_pool.key(),
+        trader: ctx.accounts.owner.key(),
+        input_mint: ctx.accounts.user_source_token_account.mint,
+        output_mint: ctx.accounts.user_destination_token_account.mint,
+        amount_in,
+        amount_out,
+        protocol_fee: actual_protocol_fee, // Use the final protocol fee after referral split
+        final_active_bin_id,
+        referrer: ctx
+            .accounts
+            .referrer_fee_account
+            .as_ref()
+            .map(|acc| acc.key()),
+    });
+
+    Ok(())
+}
+
+// Updated Accounts struct
+#[derive(Accounts)]
+pub struct DlmmSwap<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            b"dlmm_pool",
+            dlmm_pool.token_a_mint.as_ref(),
+            dlmm_pool.token_b_mint.as_ref(),
+            &dlmm_pool.bin_step.to_le_bytes()
+        ],
+        bump = dlmm_pool.bump
+    )]
+    pub dlmm_pool: Box<Account<'info, DlmmPool>>,
+
+    /// The temporary account that holds the pubkeys of the bins needed for the swap.
+    /// This account is created and closed in the same transaction.
+    #[account(
+        mut,
+        has_one = owner,
+        close = owner,
+        seeds = [b"transaction_bins", owner.key().as_ref()],
+        bump
+    )]
+    pub transaction_bins: Box<Account<'info, TransactionBins>>,
+
+    #[account(address = dlmm_pool.token_a_mint)]
+    pub token_a_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(address = dlmm_pool.token_b_mint)]
+    pub token_b_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(mut, has_one = owner)]
+    pub user_source_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, has_one = owner)]
+    pub user_destination_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, address = dlmm_pool.token_a_vault)]
+    pub token_a_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, address = dlmm_pool.token_b_vault)]
+    pub token_b_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, address = dlmm_pool.protocol_fee_vault_a)]
+    pub protocol_fee_vault_a: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut, address = dlmm_pool.protocol_fee_vault_b)]
+    pub protocol_fee_vault_b: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut)]
+    /// CHECK: Optional account for receiving referral fees.
+    pub referrer_fee_account: Option<AccountInfo<'info>>,
+
+    pub token_a_program: Interface<'info, TokenInterface>,
+    pub token_b_program: Interface<'info, TokenInterface>,
+}

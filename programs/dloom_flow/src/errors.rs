@@ -3,7 +3,9 @@
 use anchor_lang::prelude::*;
 
 #[error_code]
-pub enum MyError {
+pub enum DloomError {
+    #[msg("The provided fee rates are invalid.")]
+    InvalidFeeRates,
     #[msg("The provided fee and bin_step parameters are not on the whitelist.")]
     InvalidParameters,
     #[msg("The mint addresses are not in the correct canonical order. Token A must be less than Token B.")]
@@ -42,4 +44,14 @@ pub enum MyError {
     InvalidBinAccount,
     #[msg("The provided position account does not belong to the specified pool.")]
     InvalidPool,
+    #[msg("The list of provided bin accounts does not match the cached list in the TransactionBins account.")]
+    BinCacheMismatch,
+    #[msg("The last update was too recent. Please wait before triggering another update.")]
+    UpdateNotNeeded,
+    #[msg("The selected fee preference does not permit this action.")]
+    InvalidFeePreference,
+    #[msg("The sum of protocol and referrer fee shares cannot exceed 100%.")]
+    FeeShareExceedsTotal,
+    #[msg("The trader cannot be the referrer.")]
+    ReferrerIsTrader,
 }
