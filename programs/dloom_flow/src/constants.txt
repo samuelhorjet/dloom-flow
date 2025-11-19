@@ -1,3 +1,0 @@
-pub const BASIS_POINT_MAX: u128 = 10000;
-pub const PRECISION: u128 = 1_000_000_000_000;
-pub const MAX_BINS_PER_POSITION: i32 = 500;
