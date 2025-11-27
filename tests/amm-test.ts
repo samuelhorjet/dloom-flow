@@ -58,8 +58,8 @@ describe("dloom_flow AMM Tests", () => {
   const REFERRER_FEE_SHARE = 1000; // 10%
 
   // Wallets & Keypairs
-  const user = loadKeypairFromFile("./test-wallets/user.json");
-  const referrer = loadKeypairFromFile("./test-wallets/referrer.json");
+  const user = loadKeypairFromFile("./target/test-wallets/user.json");
+  const referrer = loadKeypairFromFile("./target/test-wallets/referrer.json");
 
   // Mints for various token standards
   let mintA_Token: PublicKey;

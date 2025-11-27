@@ -54,8 +54,8 @@ describe("dloom_flow DLMM Tests", () => {
   const BASIS_POINT_MAX = 10000;
 
   // Wallets
-  const user = loadKeypairFromFile("./test-wallets/user.json");
-  const referrer = loadKeypairFromFile("./test-wallets/referrer.json");
+  const user = loadKeypairFromFile("./target/test-wallets/user.json");
+  const referrer = loadKeypairFromFile("./target/test-wallets/referrer.json");
 
   // Mints
   let mintA: PublicKey;
